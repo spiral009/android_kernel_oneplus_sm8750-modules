@@ -65,6 +65,7 @@ struct oplus_pwm_turbo_params {
 	unsigned int pwm_mode0_thresholds[PWM_STATE_MAXNUM - 1];
 	unsigned int pwm_mode1_thresholds[PWM_STATE_MAXNUM - 1];
 	unsigned int pwm_mode2_thresholds[PWM_STATE_MAXNUM - 1];
+	unsigned int pwm_dbv_hysteresis;
 	unsigned int pwm_mode0_states_count;
 	unsigned int pwm_mode1_states_count;
 	unsigned int pwm_mode2_states_count;

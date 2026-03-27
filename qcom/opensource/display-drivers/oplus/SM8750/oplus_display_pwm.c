@@ -336,6 +336,20 @@ int oplus_panel_parse_pwm_config(struct dsi_panel *panel)
 	panel->oplus_panel.pwm_params.pwm_compatible_mode = utils->read_bool(utils->data, "oplus,pwm-compatible-mode");
 	OPLUS_PWM_INFO("oplus,pwm-compatible-mode: %s\n", panel->oplus_panel.pwm_params.pwm_compatible_mode ? "true" : "false");
 
+	/* Hysteresis dead-band (in DBV counts) around PWM tier thresholds.
+	 * Prevents LDO overcurrent alarms caused by rapid L1<->L3 switching
+	 * when auto-brightness hunts around a crossing point.
+	 * Set via oplus,pwm-dbv-hysteresis in panel DTSI; defaults to 50. */
+	rc = utils->read_u32(utils->data, "oplus,pwm-dbv-hysteresis", &val);
+	if (rc) {
+		panel->oplus_panel.pwm_params.pwm_dbv_hysteresis = 50;
+		OPLUS_PWM_INFO("oplus,pwm-dbv-hysteresis not set, using default: 50\n");
+	} else {
+		panel->oplus_panel.pwm_params.pwm_dbv_hysteresis = val;
+		OPLUS_PWM_INFO("oplus,pwm-dbv-hysteresis: %u\n", val);
+	}
+	rc = 0;
+
 	if (oplus_panel_pwm_support(panel)) {
 		if (oplus_panel_pwm_dbv_threshold_ext_cmd_enabled(panel)) {
 			panel->oplus_panel.pwm_params.oplus_pwm_dbv_ext_cmd_wq = create_singlethread_workqueue("oplus_pwm_dbv_ext_cmd");
@@ -824,6 +838,18 @@ int oplus_panel_pwm_dbv_threshold_handle(struct dsi_panel *panel, u32 backlight_
 {
 	int rc = 0;
 	enum PWM_STATE state;
+	u32 dbv_for_hysteresis;
+	/*
+	 * PWM DBV hysteresis: require the backlight to travel this many DBV
+	 * counts past a threshold before we commit a PWM tier switch.
+	 * This prevents repeated L1<->L2 flipping when auto-brightness hunts
+	 * around the threshold, which causes repeated LDO overcurrent alarms
+	 * on pmr_nalojr_l6. Tunable via oplus,pwm-dbv-hysteresis in panel DTSI;
+	 * defaults to 50 if not set.
+	 */
+	u32 hysteresis = panel->oplus_panel.pwm_params.pwm_dbv_hysteresis ?
+			panel->oplus_panel.pwm_params.pwm_dbv_hysteresis : 50;
+
 	bl_lvl = backlight_level;
 
 	if (!panel) {
@@ -843,7 +869,25 @@ int oplus_panel_pwm_dbv_threshold_handle(struct dsi_panel *panel, u32 backlight_
 
 	panel->oplus_panel.pwm_params.pwm_pulse_state_last = panel->oplus_panel.pwm_params.pwm_pulse_state;
 
-	rc = get_state_by_dbv(panel, bl_lvl, &state);
+	/*
+	 * Shift the DBV value used for threshold lookup based on the current
+	 * state to create a dead-band around each crossing point:
+	 *   - In a low-freq state (L3): subtract hysteresis so we need to rise
+	 *     further above the threshold before switching to high-freq (L1).
+	 *   - In a high-freq state (L1): add hysteresis so we need to drop
+	 *     further below the threshold before switching to low-freq (L3).
+	 * This means the up-transition fires at (threshold + hysteresis) and
+	 * the down-transition fires at (threshold - hysteresis).
+	 */
+	if (panel->oplus_panel.pwm_params.pwm_pulse_state == PWM_STATE_L3) {
+		/* Currently low-freq: require DBV to climb above threshold + hysteresis */
+		dbv_for_hysteresis = (bl_lvl > hysteresis) ? bl_lvl - hysteresis : 0;
+	} else {
+		/* Currently high-freq: require DBV to drop below threshold - hysteresis */
+		dbv_for_hysteresis = bl_lvl + hysteresis;
+	}
+
+	rc = get_state_by_dbv(panel, dbv_for_hysteresis, &state);
 	panel->oplus_panel.pwm_params.pwm_pulse_state = state;
 
 	if ((panel->oplus_panel.pwm_params.pwm_pulse_state_last != panel->oplus_panel.pwm_params.pwm_pulse_state)
