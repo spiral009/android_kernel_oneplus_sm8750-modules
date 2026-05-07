@@ -5,3 +5,4 @@ obj-y += cmdline_parser/
 obj-y += bootloader_log/
 obj-y += oplus_projectinfo/
 obj-y += bootmode/
+obj-y += htb/
