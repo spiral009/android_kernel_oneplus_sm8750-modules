@@ -158,10 +158,10 @@ static long tango32_set_mm(struct tango32_mm __user *argp)
 	}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-	if (mmap_write_lock_killable(mm))
+	if (mmap_read_lock_killable(mm))
 		return -EINTR;
 #else
-	if (down_write_killable(&mm->mmap_sem))
+	if (down_read_killable(&mm->mmap_sem))
 		return -EINTR;
 #endif
 
@@ -183,9 +183,9 @@ static long tango32_set_mm(struct tango32_mm __user *argp)
 		memcpy(mm->saved_auxv, user_auxv, sizeof(user_auxv));
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-	mmap_write_unlock(mm);
+	mmap_read_unlock(mm);
 #else
-	up_write(&mm->mmap_sem);
+	up_read(&mm->mmap_sem);
 #endif
 
 	return retval;
@@ -257,7 +257,7 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 	 * workaround we pass the ioctls through unmodified if compat_ioctl is
 	 * not provided. This should work for most ioctls.
 	 */
-	else
+	else if (f.file->f_op->unlocked_ioctl)
 		retval = f.file->f_op->unlocked_ioctl(f.file, args.cmd,
 						      args.arg);
 #endif
@@ -509,7 +509,6 @@ out_putf:
 	my_fdput_pos(f);
 	return retval;
 }
-
 
 static long tango32_ioctl(struct file *filp, unsigned int cmd,
 			  unsigned long arg)
