@@ -22,6 +22,11 @@ static void set_32bit(bool val)
 		set_thread_flag(TIF_32BIT);
 	else
 		clear_thread_flag(TIF_32BIT);
+	/*
+	 * Ensure the flag change is visible before any subsequent
+	 * operations that depend on it (e.g., in_compat_syscall).
+	 */
+	smp_mb();
 }
 
 static long tango32_get_version(struct tango32_abi_version __user *argp)
@@ -29,6 +34,9 @@ static long tango32_get_version(struct tango32_abi_version __user *argp)
 	bool compat;
 	struct tango32_abi_version abi = { .major = TANGO32_ABI_MAJOR,
 					   .minor = TANGO32_ABI_MINOR };
+
+	if (!access_ok(argp, sizeof(abi)))
+		return -EFAULT;
 
 	/*
 	 * Sanity check: ensure that setting TIF_32BIT properly results in
@@ -128,6 +136,9 @@ static long tango32_set_mm(struct tango32_mm __user *argp)
 
 	BUILD_BUG_ON(sizeof(user_auxv) != sizeof(mm->saved_auxv));
 
+	if (!access_ok(argp, sizeof(mm_fields)))
+		return -EFAULT;
+
 	if (copy_from_user(&mm_fields, argp, sizeof(mm_fields)))
 		return -EFAULT;
 
@@ -226,6 +237,9 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 	struct fd f;
 	long retval;
 
+	if (!access_ok(argp, sizeof(args)))
+		return -EFAULT;
+
 	if (copy_from_user(&args, argp, sizeof(args)))
 		return -EFAULT;
 
@@ -276,6 +290,9 @@ tango32_compat_set_robust_list(struct tango32_compat_robust_list __user *argp)
 {
 	struct tango32_compat_robust_list args;
 
+	if (!access_ok(argp, sizeof(args)))
+		return -EFAULT;
+
 	if (copy_from_user(&args, argp, sizeof(args)))
 		return -EFAULT;
 
@@ -291,6 +308,9 @@ static long
 tango32_compat_get_robust_list(struct tango32_compat_robust_list __user *argp)
 {
 	struct tango32_compat_robust_list out;
+
+	if (!access_ok(argp, sizeof(out)))
+		return -EFAULT;
 
 	out.head = ptr_to_compat(current->compat_robust_list);
 	out.len = sizeof(*current->compat_robust_list);
@@ -448,7 +468,13 @@ tango32_compat_getdents64(struct tango32_compat_getdents64 __user *argp)
 	struct getdents_callback64 buf = {};
 	int error;
 
+	if (!access_ok(argp, sizeof(args)))
+		return -EFAULT;
+
 	if (copy_from_user(&args, argp, sizeof(args)))
+		return -EFAULT;
+
+	if (!access_ok((void __user *)args.dirp, args.count))
 		return -EFAULT;
 
 	f = my_fdget_pos(args.fd);
@@ -483,6 +509,9 @@ static long tango32_compat_lseek(struct tango32_compat_lseek __user *argp)
 	int retval;
 	struct fd f;
 	loff_t offset;
+
+	if (!access_ok(argp, sizeof(args)))
+		return -EFAULT;
 
 	if (copy_from_user(&args, argp, sizeof(args)))
 		return -EFAULT;
