@@ -26,7 +26,6 @@ static void set_32bit(bool val)
 
 static long tango32_get_version(struct tango32_abi_version __user *argp)
 {
-	pr_alert("tango32: get_version\n");
 	bool compat;
 	struct tango32_abi_version abi = { .major = TANGO32_ABI_MAJOR,
 					   .minor = TANGO32_ABI_MINOR };
@@ -53,7 +52,6 @@ static long tango32_get_version(struct tango32_abi_version __user *argp)
 */
 static int validate_mm_fields(const struct tango32_mm *mm_fields)
 {
-	pr_alert("tango32: validate_mm_fields\n");
 	unsigned long mmap_max_addr = TASK_SIZE;
 	/*
 	 * mmap_min_addr is not exported to modules. However this isn't a big
@@ -123,7 +121,6 @@ out:
 
 static long tango32_set_mm(struct tango32_mm __user *argp)
 {
-	pr_alert("tango32: set_mm\n");
 	struct mm_struct *mm = current->mm;
 	unsigned long user_auxv[AT_VECTOR_SIZE];
 	struct tango32_mm mm_fields;
@@ -196,7 +193,6 @@ static long tango32_set_mm(struct tango32_mm __user *argp)
 
 static long tango32_set_mmap_base(unsigned long arg)
 {
-	pr_alert("tango32: set_mmap_base arg=0x%lx\n", arg);
 	unsigned long mmap_max_addr = TASK_SIZE;
 	/* mmap_min_addr is not exported to modules, pick a safe default. */
 	unsigned long mmap_min_addr = 0x10000000;
@@ -239,11 +235,12 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 
 	/*
 	 * Pretend to be a 32-bit task for the duration of this syscall.
+	 * Disable preemption and softirqs to prevent interrupt handlers
+	 * from seeing the wrong TIF_32BIT state.
 	 */
+	preempt_disable();
+	local_bh_disable();
 	set_32bit(true);
-
-	pr_debug("tango32_compat_ioctl: fd=%u cmd=0x%x arg=0x%x\n",
-		 args.fd, args.cmd, args.arg);
 
 	retval = security_file_ioctl(f.file, args.cmd, args.arg);
 	if (retval)
@@ -266,8 +263,9 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 #endif
 
 out:
-	pr_debug("tango32_compat_ioctl: done retval=%ld\n", retval);
 	set_32bit(false);
+	local_bh_enable();
+	preempt_enable();
 	fdput(f);
 
 	return retval;
@@ -276,7 +274,6 @@ out:
 static long
 tango32_compat_set_robust_list(struct tango32_compat_robust_list __user *argp)
 {
-	pr_alert("tango32: set_robust_list\n");
 	struct tango32_compat_robust_list args;
 
 	if (copy_from_user(&args, argp, sizeof(args)))
@@ -293,7 +290,6 @@ tango32_compat_set_robust_list(struct tango32_compat_robust_list __user *argp)
 static long
 tango32_compat_get_robust_list(struct tango32_compat_robust_list __user *argp)
 {
-	pr_alert("tango32: get_robust_list\n");
 	struct tango32_compat_robust_list out;
 
 	out.head = ptr_to_compat(current->compat_robust_list);
@@ -445,9 +441,8 @@ static void my_fdput_pos(struct fd fd)
 }
 
 static long
-	tango32_compat_getdents64(struct tango32_compat_getdents64 __user *argp)
+tango32_compat_getdents64(struct tango32_compat_getdents64 __user *argp)
 {
-	pr_alert("tango32: getdents64\n");
 	struct tango32_compat_getdents64 args;
 	struct fd f;
 	struct getdents_callback64 buf = {};
@@ -459,11 +454,6 @@ static long
 	f = my_fdget_pos(args.fd);
 	if (!f.file)
 		return -EBADF;
-
-	/*
-	 * Pretend to be a 32-bit task for the duration of this syscall.
-	 */
-	set_32bit(true);
 
 	buf.ctx.actor = filldir64;
 	buf.count = args.count;
@@ -483,18 +473,16 @@ static long
 			error = args.count - buf.count;
 	}
 
-	set_32bit(false);
 	my_fdput_pos(f);
 	return error;
 }
 
 static long tango32_compat_lseek(struct tango32_compat_lseek __user *argp)
 {
-	pr_alert("tango32: lseek\n");
 	struct tango32_compat_lseek args;
 	int retval;
 	struct fd f;
-	off_t offset;
+	loff_t offset;
 
 	if (copy_from_user(&args, argp, sizeof(args)))
 		return -EFAULT;
@@ -502,11 +490,6 @@ static long tango32_compat_lseek(struct tango32_compat_lseek __user *argp)
 	f = my_fdget_pos(args.fd);
 	if (!f.file)
 		return -EBADF;
-
-	/*
-	 * Pretend to be a 32-bit task for the duration of this syscall.
-	 */
-	set_32bit(true);
 
 	retval = -EINVAL;
 	if (args.whence > SEEK_MAX)
@@ -523,7 +506,6 @@ static long tango32_compat_lseek(struct tango32_compat_lseek __user *argp)
 	}
 
 out_putf:
-	set_32bit(false);
 	my_fdput_pos(f);
 	return retval;
 }
@@ -531,7 +513,6 @@ out_putf:
 static long tango32_ioctl(struct file *filp, unsigned int cmd,
 			  unsigned long arg)
 {
-	pr_alert("tango32: ioctl cmd=0x%x\n", cmd);
 	void __user *argp = (void __user *)arg;
 
 	/*
