@@ -236,6 +236,7 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 	struct tango32_compat_ioctl args;
 	struct fd f;
 	long retval;
+	unsigned long flags;
 
 	if (!access_ok(argp, sizeof(args)))
 		return -EFAULT;
@@ -249,11 +250,12 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 
 	/*
 	 * Pretend to be a 32-bit task for the duration of this syscall.
-	 * Disable preemption and softirqs to prevent interrupt handlers
-	 * from seeing the wrong TIF_32BIT state.
+	 * Disable local interrupts to prevent ANY handler (including NMIs
+	 * on some platforms) from seeing inconsistent TIF_32BIT state.
+	 * This is heavier than preempt_disable() but necessary for safety
+	 * when manipulating thread flags that affect syscall dispatch.
 	 */
-	preempt_disable();
-	local_bh_disable();
+	local_irq_save(flags);
 	set_32bit(true);
 
 	retval = security_file_ioctl(f.file, args.cmd, args.arg);
@@ -278,8 +280,7 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 
 out:
 	set_32bit(false);
-	local_bh_enable();
-	preempt_enable();
+	local_irq_restore(flags);
 	fdput(f);
 
 	return retval;
