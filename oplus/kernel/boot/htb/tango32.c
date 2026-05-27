@@ -9,6 +9,10 @@
 #include <linux/compat.h>
 #include <linux/thread_info.h>
 #include <linux/dirent.h>
+#include <linux/if.h>
+#include <linux/mm.h>
+#include <linux/mman.h>
+#include <linux/sockios.h>
 #include "tango32.h"
 
 static bool is_32bit(void)
@@ -231,12 +235,107 @@ static long tango32_set_mmap_base(unsigned long arg)
 	return 0;
 }
 
+/*
+ * AviumUI: SIOCGIFCONF for translated 32-bit callers, WITHOUT TIF_32BIT.
+ *
+ * SIOCGIFCONF is the common socket ioctl whose userspace layout differs
+ * between 32- and 64-bit (struct ifconf carries a pointer; struct ifreq is
+ * 32 bytes for compat vs sizeof(struct ifreq) native). The kernel's compat
+ * path requires in_compat_syscall()==true, i.e. TIF_32BIT set -- and setting
+ * that flag on this AArch64-only kernel (no AArch32 EL0) intermittently
+ * panics. So translate manually: run the NATIVE ioctl into a scratch user
+ * buffer, then repack each native ifreq into the caller's compat ifreq array.
+ * The first 32 bytes of a native ifreq (ifr_name[16] + ifr_addr sockaddr) are
+ * byte-identical to a compat ifreq, so the repack is a straight 32-byte copy.
+ */
+#define TANGO32_COMPAT_IFREQ_SZ 32u
+
+struct tango32_compat_ifconf {
+	__s32 ifc_len;
+	__u32 ifcbuf;
+};
+
+static long tango32_getifconf(struct file *file, unsigned long arg32)
+{
+	struct tango32_compat_ifconf ifc32;
+	struct ifconf ifc;
+	void __user *uifc32 = (void __user *)arg32;
+	unsigned long scratch, map_len, scratch_len;
+	long retval;
+	u32 cap, n, i;
+
+	if (!file->f_op || !file->f_op->unlocked_ioctl)
+		return -ENOTTY;
+
+	retval = security_file_ioctl(file, SIOCGIFCONF, arg32);
+	if (retval)
+		return retval;
+
+	if (copy_from_user(&ifc32, uifc32, sizeof(ifc32)))
+		return -EFAULT;
+
+	cap = (u32)ifc32.ifc_len / TANGO32_COMPAT_IFREQ_SZ;
+	if (cap > 1024)
+		cap = 1024; /* sanity clamp */
+
+	/* scratch user buffer: [struct ifconf][cap * native struct ifreq] */
+	scratch_len = sizeof(struct ifconf) +
+		      (unsigned long)cap * sizeof(struct ifreq);
+	map_len = PAGE_ALIGN(scratch_len + PAGE_SIZE);
+	scratch = vm_mmap(NULL, 0, map_len, PROT_READ | PROT_WRITE,
+			  MAP_PRIVATE | MAP_ANONYMOUS, 0);
+	if (IS_ERR_VALUE(scratch))
+		return -ENOMEM;
+
+	ifc.ifc_len = (int)((unsigned long)cap * sizeof(struct ifreq));
+	ifc.ifc_req = (struct ifreq __user *)(scratch + sizeof(struct ifconf));
+	if (copy_to_user((void __user *)scratch, &ifc, sizeof(ifc))) {
+		retval = -EFAULT;
+		goto out;
+	}
+
+	/* NATIVE ioctl -- no TIF_32BIT, so no panic. */
+	retval = file->f_op->unlocked_ioctl(file, SIOCGIFCONF, scratch);
+	if (retval < 0)
+		goto out;
+
+	if (copy_from_user(&ifc, (void __user *)scratch, sizeof(ifc))) {
+		retval = -EFAULT;
+		goto out;
+	}
+	n = (u32)ifc.ifc_len / (u32)sizeof(struct ifreq);
+
+	for (i = 0; i < n && i < cap; i++) {
+		char buf[TANGO32_COMPAT_IFREQ_SZ];
+		void __user *src = (void __user *)(scratch +
+				sizeof(struct ifconf) +
+				(unsigned long)i * sizeof(struct ifreq));
+		void __user *dst = (void __user *)(unsigned long)(ifc32.ifcbuf +
+				i * TANGO32_COMPAT_IFREQ_SZ);
+
+		if (copy_from_user(buf, src, sizeof(buf)) ||
+		    copy_to_user(dst, buf, sizeof(buf))) {
+			retval = -EFAULT;
+			goto out;
+		}
+	}
+
+	ifc32.ifc_len = (__s32)(min(n, cap) * TANGO32_COMPAT_IFREQ_SZ);
+	if (copy_to_user(uifc32, &ifc32, sizeof(ifc32))) {
+		retval = -EFAULT;
+		goto out;
+	}
+	retval = 0;
+out:
+	vm_munmap(scratch, map_len);
+	return retval;
+}
+
 static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 {
 	struct tango32_compat_ioctl args;
 	struct fd f;
 	long retval;
-	unsigned long flags;
 
 	if (!access_ok(argp, sizeof(args)))
 		return -EFAULT;
@@ -249,14 +348,21 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 		return -EBADF;
 
 	/*
-	 * Pretend to be a 32-bit task for the duration of this syscall.
-	 * Disable local interrupts to prevent ANY handler (including NMIs
-	 * on some platforms) from seeing inconsistent TIF_32BIT state.
-	 * This is heavier than preempt_disable() but necessary for safety
-	 * when manipulating thread flags that affect syscall dispatch.
+	 * AviumUI: NEVER set TIF_32BIT on this AArch64-only kernel -- doing so
+	 * intermittently panics (no AArch32 EL0 hardware; CONFIG_COMPAT is
+	 * force-enabled for Tango but the compat-mode machinery is unsafe here).
+	 *
+	 * SIOCGIFCONF is the one common socket ioctl whose 32/64 layout differs
+	 * and genuinely needs translation; handle it manually via the NATIVE
+	 * ioctl (see tango32_getifconf). All the other socket ioctls Tango
+	 * proxies (SIOCGIFFLAGS/HWADDR/INDEX/NAME/NETMASK/...) are layout-
+	 * identical for 32- and 64-bit, so the kernel's ->compat_ioctl handler
+	 * translates them correctly even without TIF_32BIT.
 	 */
-	local_irq_save(flags);
-	set_32bit(true);
+	if (args.cmd == SIOCGIFCONF) {
+		retval = tango32_getifconf(f.file, args.arg);
+		goto out;
+	}
 
 	retval = security_file_ioctl(f.file, args.cmd, args.arg);
 	if (retval)
@@ -279,8 +385,6 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 #endif
 
 out:
-	set_32bit(false);
-	local_irq_restore(flags);
 	fdput(f);
 
 	return retval;
@@ -544,6 +648,7 @@ static long tango32_ioctl(struct file *filp, unsigned int cmd,
 			  unsigned long arg)
 {
 	void __user *argp = (void __user *)arg;
+	long ret;
 
 	/*
 	 * Sanity check: we should only get called from 64-bit processes.
@@ -553,24 +658,34 @@ static long tango32_ioctl(struct file *filp, unsigned int cmd,
 
 	switch (cmd) {
 	case TANGO32_GET_VERSION:
-		return tango32_get_version(argp);
+		ret = tango32_get_version(argp);
+		break;
 	case TANGO32_SET_MM:
-		return tango32_set_mm(argp);
+		ret = tango32_set_mm(argp);
+		break;
 	case TANGO32_SET_MMAP_BASE:
-		return tango32_set_mmap_base(arg);
+		ret = tango32_set_mmap_base(arg);
+		break;
 	case TANGO32_COMPAT_IOCTL:
-		return tango32_compat_ioctl(argp);
+		ret = tango32_compat_ioctl(argp);
+		break;
 	case TANGO32_COMPAT_SET_ROBUST_LIST:
-		return tango32_compat_set_robust_list(argp);
+		ret = tango32_compat_set_robust_list(argp);
+		break;
 	case TANGO32_COMPAT_GET_ROBUST_LIST:
-		return tango32_compat_get_robust_list(argp);
+		ret = tango32_compat_get_robust_list(argp);
+		break;
 	case TANGO32_COMPAT_GETDENTS64:
-		return tango32_compat_getdents64(argp);
+		ret = tango32_compat_getdents64(argp);
+		break;
 	case TANGO32_COMPAT_LSEEK:
-		return tango32_compat_lseek(argp);
+		ret = tango32_compat_lseek(argp);
+		break;
+	default:
+		ret = -ENOIOCTLCMD;
 	}
 
-	return -ENOIOCTLCMD;
+	return ret;
 }
 
 static const struct file_operations tango32_fops = {
