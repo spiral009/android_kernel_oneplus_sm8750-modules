@@ -31055,6 +31055,14 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 		return qdf_status_to_os_return(status);
 	}
 
+	/*
+	 * AviumUI: record the active monitor channel so get_channel() can
+	 * report it to nl80211. Without this, aircrack-ng reads channel -1
+	 * and needs --ignore-negative-one on every run.
+	 */
+	mon_ctx->freq = chandef->chan->center_freq;
+	mon_ctx->bandwidth = ch_width;
+
 	hdd_exit();
 
 	return 0;
@@ -32517,6 +32525,28 @@ static int __wlan_hdd_cfg80211_get_channel(struct wiphy *wiphy,
 		ret = wlan_hdd_cfg80211_get_channel_sta(wiphy, chandef, hdd_ctx,
 							adapter, link_id);
 		break;
+	case QDF_MONITOR_MODE: {
+		/*
+		 * AviumUI: report the current monitor channel so userspace
+		 * (aircrack-ng/airodump-ng) reads a valid channel instead of
+		 * -1 (removes the need for --ignore-negative-one).
+		 */
+		struct hdd_monitor_ctx *mon_ctx =
+			WLAN_HDD_GET_MONITOR_CTX_PTR(adapter->deflink);
+		struct ieee80211_channel *chan;
+
+		if (!mon_ctx || !mon_ctx->freq) {
+			ret = -EINVAL;
+			break;
+		}
+		chan = ieee80211_get_channel(wiphy, mon_ctx->freq);
+		if (!chan) {
+			ret = -EINVAL;
+			break;
+		}
+		cfg80211_chandef_create(chandef, chan, NL80211_CHAN_NO_HT);
+		break;
+	}
 	default:
 		return -EINVAL;
 	}
