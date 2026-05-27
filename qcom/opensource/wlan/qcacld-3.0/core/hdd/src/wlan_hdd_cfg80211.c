@@ -24236,6 +24236,14 @@ int wlan_hdd_cfg80211_init(struct device *dev,
 				 | BIT(NL80211_IFTYPE_AP)
 				 | BIT(NL80211_IFTYPE_MONITOR);
 
+	/* AviumUI: advertise active monitor mode so userspace can create a
+	 * monitor vif that ACKs frames (NL80211_MNTR_FLAG_ACTIVE). Needed for
+	 * tracking AWDL/AirDrop channel hopping and for injection workflows.
+	 */
+#ifdef NL80211_FEATURE_ACTIVE_MONITOR
+	wiphy->features |= NL80211_FEATURE_ACTIVE_MONITOR;
+#endif
+
 	/*
 	 * In case of static linked driver at the time of driver unload,
 	 * module exit doesn't happens. Module cleanup helps in cleaning

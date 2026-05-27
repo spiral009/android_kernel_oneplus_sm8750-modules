@@ -3354,11 +3354,15 @@ static void hdd_mon_mode_ether_setup(struct net_device *dev)
 {
 	dev->header_ops         = NULL;
 	dev->type               = ARPHRD_IEEE80211_RADIOTAP;
-	dev->hard_header_len    = ETH_HLEN;
+	/* AviumUI: hard_header_len=0 + IFF_NOARP so userspace radiotap
+	 * injection (aireplay-ng/scapy) frames reach ndo_start_xmit as
+	 * raw radiotap+802.11 instead of being mangled as Ethernet.
+	 */
+	dev->hard_header_len    = 0;
 	dev->mtu                = ETH_DATA_LEN;
 	dev->addr_len           = ETH_ALEN;
 	dev->tx_queue_len       = 1000; /* Ethernet wants good queues */
-	dev->flags              = IFF_BROADCAST|IFF_MULTICAST;
+	dev->flags              = IFF_BROADCAST|IFF_MULTICAST|IFF_NOARP;
 	dev->priv_flags        |= IFF_TX_SKB_SHARING;
 
 	memset(dev->broadcast, 0xFF, ETH_ALEN);
@@ -3454,6 +3458,15 @@ static int __hdd_mon_open(struct net_device *dev)
 		ucfg_dp_bbm_apply_independent_policy(hdd_ctx->psoc, &param);
 		ucfg_dp_set_current_throughput_level(hdd_ctx->psoc,
 						     PLD_BUS_WIDTH_VERY_HIGH);
+		/*
+		 * AviumUI: monitor mode is RX-only by default, so its netdev
+		 * TX queue stays stopped and injected frames (aireplay/scapy)
+		 * are dropped before reaching ndo_start_xmit. Start all TX
+		 * queues + bring carrier on so raw 802.11 injection works.
+		 */
+		wlan_hdd_netif_queue_control(adapter,
+				WLAN_START_ALL_NETIF_QUEUE_N_CARRIER,
+				WLAN_CONTROL_PATH);
 	}
 
 	return ret;
@@ -7277,10 +7290,63 @@ static const struct net_device_ops wlan_drv_ops = {
 };
 
 #ifdef FEATURE_MONITOR_MODE_SUPPORT
-/* Monitor mode net_device_ops, does not Tx and most of operations. */
+/*
+ * AviumUI: experimental raw 802.11 frame injection from the monitor iface.
+ * Default OFF. Diagnostic logging is always on so we can confirm injected
+ * frames (aireplay-ng/scapy) actually reach the driver. Enable real TX with:
+ *   echo 1 > /sys/module/qca_cld3_peach_v2/parameters/mon_inject_enable
+ */
+static int mon_inject_enable;
+module_param(mon_inject_enable, int, 0644);
+MODULE_PARM_DESC(mon_inject_enable,
+		 "AviumUI: enable raw 802.11 injection from monitor interface");
+
+static netdev_tx_t hdd_mon_hard_start_xmit(struct sk_buff *skb,
+					   struct net_device *dev)
+{
+	struct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(dev);
+	uint16_t rtap_len;
+	uint8_t ftype;
+	void *soc;
+
+	if (!adapter || adapter->magic != WLAN_HDD_ADAPTER_MAGIC ||
+	    !adapter->deflink)
+		goto drop;
+
+	/* dev->type == ARPHRD_IEEE80211_RADIOTAP: skb is radiotap + 802.11 */
+	if (skb->len < 4)
+		goto drop;
+	rtap_len = (uint16_t)skb->data[2] | ((uint16_t)skb->data[3] << 8);
+	if (rtap_len < 8 || rtap_len >= skb->len)
+		goto drop;
+	skb_pull(skb, rtap_len); /* strip radiotap -> raw 802.11 */
+	if (skb->len < 10)
+		goto drop;
+	ftype = (skb->data[0] >> 2) & 0x3; /* 0=mgmt 1=ctrl 2=data */
+
+	hdd_err_rl("AVIUM MON-INJECT: vdev=%d raw_len=%d ftype=%d en=%d",
+		   adapter->deflink->vdev_id, skb->len, ftype,
+		   mon_inject_enable);
+
+	if (mon_inject_enable) {
+		soc = cds_get_context(QDF_MODULE_ID_SOC);
+		if (soc && ftype == 0) { /* mgmt frames (deauth/beacon/probe) */
+			cdp_mgmt_send_ext(soc, adapter->deflink->vdev_id,
+					  (qdf_nbuf_t)skb, 0, 0, 0);
+			/* DP mgmt-tx path takes ownership of the nbuf */
+			return NETDEV_TX_OK;
+		}
+	}
+drop:
+	dev_kfree_skb_any(skb);
+	return NETDEV_TX_OK;
+}
+
+/* Monitor mode net_device_ops; AviumUI added ndo_start_xmit for injection. */
 static const struct net_device_ops wlan_mon_drv_ops = {
 	.ndo_open = hdd_mon_open,
 	.ndo_stop = hdd_stop,
+	.ndo_start_xmit = hdd_mon_hard_start_xmit,
 	.ndo_get_stats = hdd_get_stats,
 };
 

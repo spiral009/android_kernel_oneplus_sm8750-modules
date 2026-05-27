@@ -1263,7 +1263,13 @@ static void fill_wiphy_channel(struct ieee80211_channel *wiphy_chan,
 
 	if (cur_chan->chan_flags & REGULATORY_CHAN_DISABLED)
 		wiphy_chan->flags  |= IEEE80211_CHAN_DISABLED;
-	if (cur_chan->chan_flags & REGULATORY_CHAN_NO_IR)
+	/* AviumUI: regulatory unlock - do NOT propagate NO_IR so userspace may
+	 * actively transmit / inject and run active monitor on passive & DFS
+	 * channels (e.g. AWDL social channels 44/149). Aggressive: bypasses the
+	 * host-side "no initiating radiation" restriction. Firmware reg domain
+	 * may still apply its own limits.
+	 */
+	if (0 && (cur_chan->chan_flags & REGULATORY_CHAN_NO_IR))
 		wiphy_chan->flags  |= IEEE80211_CHAN_NO_IR;
 	if (cur_chan->chan_flags & REGULATORY_CHAN_RADAR)
 		wiphy_chan->flags  |= IEEE80211_CHAN_RADAR;
